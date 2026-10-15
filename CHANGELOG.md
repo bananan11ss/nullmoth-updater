@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.0
+
+- Вкладка «Сборка EFI»: OpenCore с нуля под этот компьютер.
+  - Железо: CPU и поколение, ноутбук/ПК, PCI-устройства (графика, сеть, Wi-Fi, NVMe), аудиокодек и его раскладка,
+    дерево ACPI (корень, LPC, EC, процессоры, тачпад I2C, PS/2).
+  - OpenCore и кексты из dortania/build-repo с проверкой SHA-256 (+ AMFIPass для NullMoth, релизы GitHub).
+  - SSDT по найденным путям ACPI (PLUG / PLUG-ALT, EC, USBX, AWAC, SBUS).
+  - config.plist из Sample.plist той же версии OpenCore по правилам Dortania, с настройками NullMoth
+    (boot-args, SIP, SecureBootModel, блок IONDRVSupport) и подменой CPUID для Alder Lake и новее.
+  - Из текущей EFI берётся то, что принадлежит этому Mac: SMBIOS, карта USB, AirportItlwm, патчи, BAR, свои boot-args.
+  - Проверка `ocvalidate` и отчёт с отличиями от текущей EFI.
+  - Результат — папка; в загрузочную EFI сборщик не пишет. Запись на флешку — с резервной копией и проверкой.
+
 ## 1.2.0
 
 - Вкладка «EFI»: все EFI-разделы и FAT32-разделы флешек, отметка загрузочного раздела (по `boot-path` OpenCore),

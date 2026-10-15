@@ -14,6 +14,8 @@ if [ -f driver-patch/NVMTLDriver ]; then
   cp driver-patch/NVMTLDriver "$APP/Contents/Resources/NVMTLDriver-fixed"
   cp driver-patch/LICENSE-PolyForm-Noncommercial.md driver-patch/NOTICE "$APP/Contents/Resources/"
 fi
+# compiled SSDTs for the EFI builder (sources in builder/acpi/src)
+mkdir -p "$APP/Contents/Resources/ACPI" && cp builder/acpi/aml/*.aml "$APP/Contents/Resources/ACPI/"
 IS=$(mktemp -d)/u.iconset; mkdir -p "$IS"
 for s in 16 32 128 256 512; do
   sips -z $s $s Resources/AppIcon.png --out "$IS/icon_${s}x${s}.png" >/dev/null
@@ -29,8 +31,8 @@ cat > "$APP/Contents/Info.plist" <<'PL'
 <key>CFBundleIdentifier</key><string>io.github.bananan11ss.nullmoth-updater</string>
 <key>CFBundleName</key><string>NullMoth Updater</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.2.0</string>
-<key>CFBundleVersion</key><string>4</string>
+<key>CFBundleShortVersionString</key><string>1.3.0</string>
+<key>CFBundleVersion</key><string>5</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>LSMinimumSystemVersion</key><string>15.0</string>
 <key>NSHighResolutionCapable</key><true/>

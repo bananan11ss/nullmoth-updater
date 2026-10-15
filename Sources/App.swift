@@ -5,12 +5,14 @@ import SwiftUI
 struct NullMothUpdaterApp: App {
     @StateObject private var model = UpdaterModel()
     @StateObject private var efi = EFIModel()
+    @StateObject private var builder = BuilderModel()
 
     var body: some Scene {
         WindowGroup("NullMoth Updater") {
             ContentView()
                 .environmentObject(model)
                 .environmentObject(efi)
+                .environmentObject(builder)
                 .frame(minWidth: 820, minHeight: 700)
                 .onAppear { model.refresh(); efi.refresh() }
         }
@@ -40,6 +42,9 @@ struct ContentView: View {
                 EFITab()
                     .padding(10)
                     .tabItem { Text("EFI") }
+                BuilderTab()
+                    .padding(10)
+                    .tabItem { Text("Сборка EFI") }
             }
             .frame(minHeight: 300)
             PhaseBanner()

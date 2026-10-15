@@ -277,6 +277,26 @@ final class EFIModel: ObservableObject {
         }
     }
 
+    /// Writes a build folder (one holding EFI/OC) to a partition, with the same backup, check and rollback.
+    func copy(fromFolder base: URL, to id: String) {
+        guard let t = esps.first(where: { $0.id == id }) else { done(false, "Раздел не найден"); return }
+        busy = "Монтирую \(t.id)…"; message = nil; log = ""
+        Task {
+            guard await mountAsAdmin([t.id]) else { return }
+            let list = await Task.detached { EFI.list() }.value
+            guard let tm = list.first(where: { $0.id == t.id })?.mountPoint else { done(false, "Раздел не смонтировался"); return }
+            let backup = EFI.backupRoot.appendingPathComponent("\(Self.stamp())-\(t.id)-before-build").path
+            let script = EFI.copyScript(src: base.path, dst: tm, backup: backup, uid: getuid())
+            busy = "Записываю сборку на \(t.id)…"
+            let r = await Task.detached { Shell.runAsAdmin(script) }.value
+            log = r.output
+            done(r.status == 0, r.status == 0
+                 ? "Записано на \(t.id). Старая EFI сохранена в \(backup). Перезагрузись и выбери этот диск в загрузочном меню."
+                 : (r.status == -128 ? "Отменено" : "Не получилось: \(r.output.suffix(300))"))
+            refresh()
+        }
+    }
+
     private static func stamp() -> String {
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd_HH-mm-ss"; return f.string(from: Date())
     }
