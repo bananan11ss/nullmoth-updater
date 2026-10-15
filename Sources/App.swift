@@ -4,13 +4,15 @@ import SwiftUI
 @main
 struct NullMothUpdaterApp: App {
     @StateObject private var model = UpdaterModel()
+    @StateObject private var efi = EFIModel()
 
     var body: some Scene {
         WindowGroup("NullMoth Updater") {
             ContentView()
                 .environmentObject(model)
-                .frame(minWidth: 760, minHeight: 640)
-                .onAppear { model.refresh() }
+                .environmentObject(efi)
+                .frame(minWidth: 820, minHeight: 700)
+                .onAppear { model.refresh(); efi.refresh() }
         }
         .windowResizability(.contentMinSize)
     }
@@ -35,6 +37,9 @@ struct ContentView: View {
                 TuningCard()
                     .padding(10)
                     .tabItem { Text("Игры и производительность") }
+                EFITab()
+                    .padding(10)
+                    .tabItem { Text("EFI") }
             }
             .frame(minHeight: 300)
             PhaseBanner()

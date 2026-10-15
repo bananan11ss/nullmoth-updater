@@ -29,8 +29,8 @@ cat > "$APP/Contents/Info.plist" <<'PL'
 <key>CFBundleIdentifier</key><string>io.github.bananan11ss.nullmoth-updater</string>
 <key>CFBundleName</key><string>NullMoth Updater</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.1.0</string>
-<key>CFBundleVersion</key><string>3</string>
+<key>CFBundleShortVersionString</key><string>1.2.0</string>
+<key>CFBundleVersion</key><string>4</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>LSMinimumSystemVersion</key><string>15.0</string>
 <key>NSHighResolutionCapable</key><true/>
