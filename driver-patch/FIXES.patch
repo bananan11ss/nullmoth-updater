@@ -1,0 +1,1006 @@
+diff -ruN --exclude=out --exclude=FIXES.patch --exclude=FIXES.md a/app/Resources/nullmoth-install.sh b/app/Resources/nullmoth-install.sh
+--- a/app/Resources/nullmoth-install.sh	2026-10-15 09:28:42
++++ b/app/Resources/nullmoth-install.sh	2026-10-15 10:21:32
+@@ -270,7 +270,11 @@
+   fi
+ fi
+ echo "$MAJ" > /Library/NullMoth/os-major || die "record selected OS"
+-mkdir -p "$GB" "$FW" || die "create bundle and firmware directories"
++# NVRM boots the GPU from this firmware, and /Users/Shared is writable by every account: a planted symlink or file
++# there would be loaded into the GPU. Replace the folder wholesale and make it root-owned.
++[ ! -L "$FW" ] || die "$FW is a symbolic link; remove it and install again (restore from $BK)"
++mkdir -p "$GB" || die "create bundle directory"
++rm -rf "$FW" && mkdir -p "$FW" || die "create firmware directory"
+ # $GB/nvmtl is replaced wholesale below, so move the shared shader caches aside first. NVMTLLibraryLoad.m
+ # reads them from NVMTL_AIRCACHE_DIR (/Library/GPUBundles/nvmtl/aircache) and uses that path whenever it is
+ # writable, which is what lets every process - WindowServer included - share one persistent cache instead of
+@@ -285,7 +289,7 @@
+   ditto /Library/NullMoth/gpu-userland "$GB/nvmtl" || die "copy the AMD/Intel Vulkan drivers (restore from $BK)"
+ fi
+ cp "$HERE/Library/GPUBundles/nvmtl-allow.txt" "$GB/" || die "copy bundle allow list"
+-ditto "$HERE/Users/Shared/nvfw" "$FW" || die "copy firmware"
++ditto "$HERE/Users/Shared/nvfw" "$FW" && chown -R root:wheel "$FW" && chmod -R go-w "$FW" || die "copy firmware"
+ for k in $KEXTS; do chown -R root:wheel "$EXT/$k.kext" && chmod -R 755 "$EXT/$k.kext" || die "permissions for $k"; done
+ chown -R root:wheel "$GB/NVMTLDriver.bundle" "$GB/NVIDIAShared.bundle" "$GB/nvmtl" "$GB/nvmtl-allow.txt" && chmod -R a+rX "$FW" || die "bundle or firmware permissions"
+ # WindowServer runs as _windowserver and must read the bundles and the allow list. WAS: cp under the app's privileged
+@@ -304,6 +308,16 @@
+ # WindowServer. Other processes see the folders read-only and keep their own private caches, which the plugin already
+ # does when NVMTL_AIRCACHE_DIR is not writable. A cache kept from an earlier install is reused only if nobody but
+ # _windowserver could have written into it; otherwise it starts empty.
++# aircache entries are keyed by the AIR bytes alone and hold the plugin's own AIR rewrite, so an update that fixes the
++# rewrite or the translator kept serving the old output. Keep the caches only across installs of the same shader stack.
++CACHESTAMP=/Library/NullMoth/shader-cache-build
++NEWSTAMP=$(cat "$GB/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver" "$GB/NVMTLDriver.bundle/Contents/MacOS/libnvmtl_translate.dylib" \
++  "$GB/nvmtl/libnvmtl_translate.dylib" "$GB/nvmtl/air-opt" 2>/dev/null | shasum -a 256 | cut -c1-64)
++if [ -n "$CACHEKEPT" ] && [ "$(cat "$CACHESTAMP" 2>/dev/null)" != "$NEWSTAMP" ]; then
++  echo "   note: the shader translator changed; the shared shader caches start empty"
++  for c in $CACHEKEPT; do rm -rf "$T/keep-$c"; done; CACHEKEPT=""
++fi
++printf '%s\n' "$NEWSTAMP" > "$CACHESTAMP" || die "record the shader cache build"
+ for c in $CACHEKEPT; do
+   [ -d "$T/keep-$c" ] || continue
+   if [ -z "$(find "$T/keep-$c" \( ! -user _windowserver -o -perm -o+w -o -perm -g+w \) -print -quit 2>/dev/null)" ]; then
+@@ -324,7 +338,8 @@
+ # Record the version for the app's update check. Only the app's setup wrote it, so installs from the release tar left it
+ # empty and the app kept offering the version already installed (10-10 chat, 1.10.0).
+ if [ -f "$HERE/VERSION" ]; then mkdir -p /Library/NullMoth && tr -cd '0-9.\n' < "$HERE/VERSION" | head -n 1 > /Library/NullMoth/driver-version.tmp \
+-  && chmod 644 /Library/NullMoth/driver-version.tmp && mv /Library/NullMoth/driver-version.tmp /Library/NullMoth/driver-version; fi
++  && chmod 644 /Library/NullMoth/driver-version.tmp && mv /Library/NullMoth/driver-version.tmp /Library/NullMoth/driver-version \
++  && chmod 755 /Library/NullMoth; fi
+ 
+ step "6. boot-args"
+ # A remove flag left by a boot-picker removal that did not finish keeps every NullMoth kext off at boot. Installing
+@@ -335,4 +350,4 @@
+ 
+ echo; echo "Done. Reboot now: sudo shutdown -r now"
+ echo "If macOS asks, allow the extensions in System Settings > Privacy & Security, then reboot once more."
+-echo "Undo: sudo ./uninstall.sh $BK"
++echo "Remove the driver: sudo ./uninstall.sh (the previous driver's files are kept in $BK)"
+diff -ruN --exclude=out --exclude=FIXES.patch --exclude=FIXES.md a/app/Resources/nullmoth-setup.sh b/app/Resources/nullmoth-setup.sh
+--- a/app/Resources/nullmoth-setup.sh	2026-10-15 09:28:42
++++ b/app/Resources/nullmoth-setup.sh	2026-10-15 10:21:32
+@@ -1335,7 +1335,9 @@
+   EDITS=("${KEEP[@]+"${KEEP[@]}"}"); NEEDBLOCK=0
+ fi
+ if [ $DRY = 0 ]; then
+-  mkdir -p "$ST" || stop "could not create the install state directory"
++  # the app's helper runs under umask 077, which made this folder 0700: the app (not root) then could not read
++  # driver-version and offered the installed driver as an update forever. The files inside keep their own modes.
++  mkdir -p "$ST" && chmod 755 "$ST" || stop "could not create the install state directory"
+   OLD_STATE="$ST/state.before-install"; HAD_STATE=0
+   if [ -f "$STATE" ]; then cp -p "$STATE" "$OLD_STATE" || stop "could not preserve the existing recovery record"; HAD_STATE=1; fi
+   UUID=""; [ -z "$CFG" ] && UUID=$(diskutil info "$EFI" | awk -F': *' '/Partition UUID/{print $2}')
+diff -ruN --exclude=out --exclude=FIXES.patch --exclude=FIXES.md a/kexts/NVRM/os-xnu2.cpp b/kexts/NVRM/os-xnu2.cpp
+--- a/kexts/NVRM/os-xnu2.cpp	2026-10-15 09:28:42
++++ b/kexts/NVRM/os-xnu2.cpp	2026-10-15 10:20:00
+@@ -11,6 +11,7 @@
+ #include <IOKit/IOLocks.h>
+ #include <kern/thread.h>
+ #include <kern/thread_call.h>
++#include <i386/machine_routines.h>
+ #include <kern/clock.h>
+ #include <kern/task.h>
+ #include <sys/vnode.h>
+@@ -1170,17 +1171,31 @@
+ }
+ void NV_API_CALL nv_put_firmware(const void *fw_handle) { TRC; if (fw_handle) kern_os_free((void *)fw_handle); }
+ 
+-struct os_wait_queue { IOLock *lock; };
++// Linux builds these on a completion: os_wake_up is complete_all, so a wake that comes before the wait still releases
++// it. A bare IOLockSleep lost such a wake and left the waiter asleep for good (uninterruptible).
++struct os_wait_queue { IOLock *lock; volatile bool done; };
+ NV_STATUS NV_API_CALL os_alloc_wait_queue(os_wait_queue **wq)
+ {
+     TRC; os_wait_queue *q = (os_wait_queue *)kern_os_malloc(sizeof *q); if (!q) return NV_ERR_NO_MEMORY;
+     q->lock = IOLockAlloc(); if (!q->lock) { kern_os_free(q); return NV_ERR_NO_MEMORY; }
++    q->done = false;
+     *wq = q; return NV_OK;
+ }
+ void NV_API_CALL os_free_wait_queue(os_wait_queue *wq) { TRC; if (wq) { IOLockFree(wq->lock); kern_os_free(wq); } }
+-void NV_API_CALL os_wait_uninterruptible(os_wait_queue *wq) { TRC; IOLockLock(wq->lock); IOLockSleep(wq->lock, wq, THREAD_UNINT); IOLockUnlock(wq->lock); }
+-void NV_API_CALL os_wait_interruptible(os_wait_queue *wq)   { TRC; IOLockLock(wq->lock); IOLockSleep(wq->lock, wq, THREAD_INTERRUPTIBLE); IOLockUnlock(wq->lock); }
+-void NV_API_CALL os_wake_up(os_wait_queue *wq)              { TRC; IOLockLock(wq->lock); IOLockWakeup(wq->lock, wq, false); IOLockUnlock(wq->lock); }
++void NV_API_CALL os_wait_uninterruptible(os_wait_queue *wq)
++{
++    TRC; IOLockLock(wq->lock); while (!wq->done) IOLockSleep(wq->lock, wq, THREAD_UNINT); IOLockUnlock(wq->lock);
++}
++void NV_API_CALL os_wait_interruptible(os_wait_queue *wq)
++{
++    TRC; IOLockLock(wq->lock);
++    while (!wq->done) if (IOLockSleep(wq->lock, wq, THREAD_INTERRUPTIBLE) == THREAD_INTERRUPTED) break;
++    IOLockUnlock(wq->lock);
++}
++void NV_API_CALL os_wake_up(os_wait_queue *wq)
++{
++    TRC; IOLockLock(wq->lock); wq->done = true; IOLockWakeup(wq->lock, wq, false); IOLockUnlock(wq->lock);
++}
+ 
+ static void nv_xnu_work_thread(void *item, wait_result_t)
+ {
+@@ -1369,17 +1384,19 @@
+ }
+ NvU32 NV_API_CALL nv_get_dev_minor(nv_state_t *nv) { TRC; return 0; }
+ 
+-struct nv_nano_timer { nv_state_t *nv; void *event; thread_call_t call; };
++struct nv_nano_timer { nv_state_t *nv; void *event; thread_call_t call; thread_t volatile running; };
+ static void nv_xnu_nano_fire(thread_call_param_t p0, thread_call_param_t p1)
+ {
+     nv_nano_timer_t *t = (nv_nano_timer_t *)p0;
++    t->running = current_thread();
+     rm_run_nano_timer_callback(NULL, t->nv, t->event);
++    t->running = NULL;
+ }
+ void NV_API_CALL nv_create_nano_timer(nv_state_t *nv, void *pTmrEvent, nv_nano_timer_t **pt)
+ {
+     TRC; nv_nano_timer_t *t = (nv_nano_timer_t *)kern_os_malloc(sizeof *t);
+     if (!t) { *pt = NULL; return; }
+-    t->nv = nv; t->event = pTmrEvent; t->call = thread_call_allocate(nv_xnu_nano_fire, t);
++    t->nv = nv; t->event = pTmrEvent; t->running = NULL; t->call = thread_call_allocate(nv_xnu_nano_fire, t);
+     *pt = t;
+ }
+ void NV_API_CALL nv_start_nano_timer(nv_state_t *nv, nv_nano_timer_t *t, NvU64 timens)
+@@ -1391,7 +1408,16 @@
+ void NV_API_CALL nv_cancel_nano_timer(nv_state_t *nv, nv_nano_timer_t *t) { if (t && t->call) thread_call_cancel(t->call); }
+ void NV_API_CALL nv_destroy_nano_timer(nv_state_t *nv, nv_nano_timer_t *t)
+ {
+-    TRC; if (!t) return; if (t->call) { thread_call_cancel(t->call); thread_call_free(t->call); } kern_os_free(t);
++    TRC; if (!t) return;
++    // Linux cancels with hrtimer_cancel, which waits for a running callback; RM frees the timer event right after
++    // this returns, so a callback still running would read freed memory. Waiting from inside the callback itself, or
++    // with interrupts off, would panic, so those cases only cancel.
++    if (t->call) {
++        if (t->running != current_thread() && ml_get_interrupts_enabled()) thread_call_cancel_wait(t->call);
++        else thread_call_cancel(t->call);
++        thread_call_free(t->call);
++    }
++    kern_os_free(t);
+ }
+ 
+ extern "C" nv_file_private_t *nv_xnu_lookup_fd(NvS32 fd, void **priv, NvBool *isCtl);
+@@ -1418,6 +1444,7 @@
+ NV_STATUS NV_API_CALL nv_alloc_user_mapping(nv_state_t *nv, void *pAllocPrivate, NvU64 pageIndex, NvU32 pageOffset, NvU64 size, NvU32 protect, NvU64 *pUserAddress, void **ppPrivate)
+ {
+     TRC; nv_xnu_alloc *a = (nv_xnu_alloc *)pAllocPrivate; if (!a || pageIndex >= a->page_count) return NV_ERR_INVALID_ARGUMENT;
++    if (!a->md) return NV_ERR_NOT_SUPPORTED;
+     IOByteCount len = 0;
+     addr64_t phys = a->md->getPhysicalSegment((IOByteCount)(pageIndex * PAGE_SIZE), &len, kIOMemoryMapperNone);
+     if (!phys) return NV_ERR_GENERIC;
+@@ -1427,7 +1454,7 @@
+ void NV_API_CALL nv_free_user_mapping(nv_state_t *nv, void *pAllocPrivate, NvU64 userAddress, void *pPrivate) { TRC; }
+ NV_STATUS NV_API_CALL os_match_mmap_offset(void *pAllocPrivate, NvU64 offset, NvU64 *pPageIndex)
+ {
+-    TRC; nv_xnu_alloc *a = (nv_xnu_alloc *)pAllocPrivate; if (!a) return NV_ERR_OBJECT_NOT_FOUND;
++    TRC; nv_xnu_alloc *a = (nv_xnu_alloc *)pAllocPrivate; if (!a || !a->md) return NV_ERR_OBJECT_NOT_FOUND;
+     for (NvU32 i = 0; i < a->page_count; i++) {
+         IOByteCount len = 0;
+         addr64_t phys = a->md->getPhysicalSegment((IOByteCount)((NvU64)i * PAGE_SIZE), &len, kIOMemoryMapperNone);
+diff -ruN --exclude=out --exclude=FIXES.patch --exclude=FIXES.md a/kexts/NVRMFB/fb/nvrm-fb.cpp b/kexts/NVRMFB/fb/nvrm-fb.cpp
+--- a/kexts/NVRMFB/fb/nvrm-fb.cpp	2026-10-15 09:28:42
++++ b/kexts/NVRMFB/fb/nvrm-fb.cpp	2026-10-15 10:20:33
+@@ -163,7 +163,8 @@
+ 
+ void NVRMBacklightHandler::free()
+ {
+-    if (fApply) { thread_call_cancel(fApply); while (!thread_call_free(fApply)) { thread_call_cancel(fApply); IOSleep(1); } fApply = nullptr; }
++    // applyFire runs without a reference on the handler: wait for a running one before the handler's memory goes.
++    if (fApply) { thread_call_cancel_wait(fApply); while (!thread_call_free(fApply)) { thread_call_cancel(fApply); IOSleep(1); } fApply = nullptr; }
+     OSSafeReleaseNULL(fFn);
+     OSSafeReleaseNULL(fRM);
+     IODisplayParameterHandler::free();
+@@ -2626,6 +2627,8 @@
+     nvrmfbInstallSysctl();
+     r->phys = 0; r->kva = nullptr; r->handle = nullptr; r->actualSize = 0; r->mappedTotal = 0;
+     if (!fKms || !fDev) { FBLOG("nvAllocVram: no NVKMS device yet"); return false; }
++    // the size comes from the accelerator's resource length: one past 2^63 turned negative in the SInt64 budget check
++    if (r->size > (1ull << 40)) { FBLOG("nvAllocVram(%llu): REFUSED - larger than any BAR1", (unsigned long long)r->size); return false; }
+     NvU64 want = (r->size + 0xFFFFull) & ~0xFFFFull;
+     if (!want) return false;
+ 
+diff -ruN --exclude=out --exclude=FIXES.patch --exclude=FIXES.md a/package/install.sh b/package/install.sh
+--- a/package/install.sh	2026-10-15 09:28:42
++++ b/package/install.sh	2026-10-15 10:21:32
+@@ -270,7 +270,11 @@
+   fi
+ fi
+ echo "$MAJ" > /Library/NullMoth/os-major || die "record selected OS"
+-mkdir -p "$GB" "$FW" || die "create bundle and firmware directories"
++# NVRM boots the GPU from this firmware, and /Users/Shared is writable by every account: a planted symlink or file
++# there would be loaded into the GPU. Replace the folder wholesale and make it root-owned.
++[ ! -L "$FW" ] || die "$FW is a symbolic link; remove it and install again (restore from $BK)"
++mkdir -p "$GB" || die "create bundle directory"
++rm -rf "$FW" && mkdir -p "$FW" || die "create firmware directory"
+ # $GB/nvmtl is replaced wholesale below, so move the shared shader caches aside first. NVMTLLibraryLoad.m
+ # reads them from NVMTL_AIRCACHE_DIR (/Library/GPUBundles/nvmtl/aircache) and uses that path whenever it is
+ # writable, which is what lets every process - WindowServer included - share one persistent cache instead of
+@@ -285,7 +289,7 @@
+   ditto /Library/NullMoth/gpu-userland "$GB/nvmtl" || die "copy the AMD/Intel Vulkan drivers (restore from $BK)"
+ fi
+ cp "$HERE/Library/GPUBundles/nvmtl-allow.txt" "$GB/" || die "copy bundle allow list"
+-ditto "$HERE/Users/Shared/nvfw" "$FW" || die "copy firmware"
++ditto "$HERE/Users/Shared/nvfw" "$FW" && chown -R root:wheel "$FW" && chmod -R go-w "$FW" || die "copy firmware"
+ for k in $KEXTS; do chown -R root:wheel "$EXT/$k.kext" && chmod -R 755 "$EXT/$k.kext" || die "permissions for $k"; done
+ chown -R root:wheel "$GB/NVMTLDriver.bundle" "$GB/NVIDIAShared.bundle" "$GB/nvmtl" "$GB/nvmtl-allow.txt" && chmod -R a+rX "$FW" || die "bundle or firmware permissions"
+ # WindowServer runs as _windowserver and must read the bundles and the allow list. WAS: cp under the app's privileged
+@@ -304,6 +308,16 @@
+ # WindowServer. Other processes see the folders read-only and keep their own private caches, which the plugin already
+ # does when NVMTL_AIRCACHE_DIR is not writable. A cache kept from an earlier install is reused only if nobody but
+ # _windowserver could have written into it; otherwise it starts empty.
++# aircache entries are keyed by the AIR bytes alone and hold the plugin's own AIR rewrite, so an update that fixes the
++# rewrite or the translator kept serving the old output. Keep the caches only across installs of the same shader stack.
++CACHESTAMP=/Library/NullMoth/shader-cache-build
++NEWSTAMP=$(cat "$GB/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver" "$GB/NVMTLDriver.bundle/Contents/MacOS/libnvmtl_translate.dylib" \
++  "$GB/nvmtl/libnvmtl_translate.dylib" "$GB/nvmtl/air-opt" 2>/dev/null | shasum -a 256 | cut -c1-64)
++if [ -n "$CACHEKEPT" ] && [ "$(cat "$CACHESTAMP" 2>/dev/null)" != "$NEWSTAMP" ]; then
++  echo "   note: the shader translator changed; the shared shader caches start empty"
++  for c in $CACHEKEPT; do rm -rf "$T/keep-$c"; done; CACHEKEPT=""
++fi
++printf '%s\n' "$NEWSTAMP" > "$CACHESTAMP" || die "record the shader cache build"
+ for c in $CACHEKEPT; do
+   [ -d "$T/keep-$c" ] || continue
+   if [ -z "$(find "$T/keep-$c" \( ! -user _windowserver -o -perm -o+w -o -perm -g+w \) -print -quit 2>/dev/null)" ]; then
+@@ -324,7 +338,8 @@
+ # Record the version for the app's update check. Only the app's setup wrote it, so installs from the release tar left it
+ # empty and the app kept offering the version already installed (10-10 chat, 1.10.0).
+ if [ -f "$HERE/VERSION" ]; then mkdir -p /Library/NullMoth && tr -cd '0-9.\n' < "$HERE/VERSION" | head -n 1 > /Library/NullMoth/driver-version.tmp \
+-  && chmod 644 /Library/NullMoth/driver-version.tmp && mv /Library/NullMoth/driver-version.tmp /Library/NullMoth/driver-version; fi
++  && chmod 644 /Library/NullMoth/driver-version.tmp && mv /Library/NullMoth/driver-version.tmp /Library/NullMoth/driver-version \
++  && chmod 755 /Library/NullMoth; fi
+ 
+ step "6. boot-args"
+ # A remove flag left by a boot-picker removal that did not finish keeps every NullMoth kext off at boot. Installing
+@@ -335,4 +350,4 @@
+ 
+ echo; echo "Done. Reboot now: sudo shutdown -r now"
+ echo "If macOS asks, allow the extensions in System Settings > Privacy & Security, then reboot once more."
+-echo "Undo: sudo ./uninstall.sh $BK"
++echo "Remove the driver: sudo ./uninstall.sh (the previous driver's files are kept in $BK)"
+diff -ruN --exclude=out --exclude=FIXES.patch --exclude=FIXES.md a/plugin/NVMTLDevice.m b/plugin/NVMTLDevice.m
+--- a/plugin/NVMTLDevice.m	2026-10-15 09:28:42
++++ b/plugin/NVMTLDevice.m	2026-10-15 10:15:58
+@@ -400,6 +400,7 @@
+     [self nvmtlProbeGPUPass];
+     if (nvmtl_vk_init()) {
+         nvlog("  NVK did not come up in this process - refusing to be the Metal device for %s", getprogname());
++        if (gNVMTLMainDevice == self) gNVMTLMainDevice = nil;
+         return nil;
+     }
+     if (nvmtl_vk_vendor() == 0x10de) {   /* NVDEC/NVENC are NVIDIA engines reached through NVRM */
+@@ -459,7 +460,7 @@
+ - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)n {
+     if (nvmtl_vk_init()) { nvlog("newCommandQueue: Vulkan/NVK is down — no queue"); return nil; }
+     NVMTLCommandQueue *q = [NVMTLCommandQueue new];
+-    q->_capacityCount = n ? n : 64;
++    q->_capacityCount = n && n <= 4096 ? n : 64;
+     q->_dev = self;
+     if (nvmtl_vk_queue_create(&q->_q)) { nvlog("newCommandQueue: command pool FAILED"); return nil; }
+     nvlog("newCommandQueue -> %p (NVK command pool)", (__bridge void *)q); return q; }
+@@ -1649,7 +1650,7 @@
+ - (BOOL)supportsRaytracingFromRender { return nvmtl_vk_rt_available() != 0; }
+ - (MTLAccelerationStructureSizes)accelerationStructureSizesWithDescriptor:(MTLAccelerationStructureDescriptor *)desc {
+     MTLAccelerationStructureSizes s = { 0, 0, 0 };
+-    static nvmtl_geom geoms[NVMTL_MAX_GEOMS]; int instance = 0; uint32_t icount = 0;
++    static _Thread_local nvmtl_geom geoms[NVMTL_MAX_GEOMS]; int instance = 0; uint32_t icount = 0;
+     uint32_t n = nvmtl_geoms_from_descriptor(desc, geoms, NVMTL_MAX_GEOMS, &instance, &icount, nil);
+     size_t as = 0, sc = 0;
+     if (nvmtl_vk_accel_sizes(geoms, n, instance, icount, &as, &sc)) {
+diff -ruN --exclude=out --exclude=FIXES.patch --exclude=FIXES.md a/plugin/NVMTLDevice_contract.m b/plugin/NVMTLDevice_contract.m
+--- a/plugin/NVMTLDevice_contract.m	2026-10-15 09:28:42
++++ b/plugin/NVMTLDevice_contract.m	2026-10-15 10:15:37
+@@ -60,6 +60,7 @@
+     if (nvmtl_vk_buffer_create(a1, 1, &b->_b) || !b->_b.map) {
+         nvmtl_alloc_failed("newBufferWithBytesNoCopy");
+         nvlog("newBufferWithBytesNoCopy: could neither import nor allocate %lu bytes -> nil", (unsigned long)a1);
++        b->_hostDealloc = nil;   // the caller still owns its memory when we return nil
+         return nil;
+     }
+     memcpy(b->_b.map, a0, a1);
+diff -ruN --exclude=out --exclude=FIXES.patch --exclude=FIXES.md a/plugin/NVMTLEmbedded.m b/plugin/NVMTLEmbedded.m
+--- a/plugin/NVMTLEmbedded.m	2026-10-15 09:28:42
++++ b/plugin/NVMTLEmbedded.m	2026-10-15 10:15:58
+@@ -86,7 +86,8 @@
+     if ([lo isKindOfClass:[NSNumber class]]) d.lodMinClamp = lo.floatValue;
+     if ([hi isKindOfClass:[NSNumber class]]) d.lodMaxClamp = hi.floatValue;
+     if (bad) return nil;
+-    return [MTLCreateSystemDefaultDevice() newSamplerStateWithDescriptor:d];
++    id<MTLDevice> dev = (id<MTLDevice>)gNVMTLMainDevice ?: MTLCreateSystemDefaultDevice();
++    return [dev newSamplerStateWithDescriptor:d];
+ }
+ static const void *NVMTL_SSAMP_KEY = &NVMTL_SSAMP_KEY;
+ static NSArray<NSArray *> *nvmtl_static_samplers(NVMTLFunction *fn)
+@@ -213,6 +214,7 @@
+     if (nvmtl_static_samplers_on()) {
+         for (NSArray *pair in nvmtl_static_samplers(fn)) {
+             NVMTLSamplerState *s = pair[1];
++            if (![s isKindOfClass:[NVMTLSamplerState class]]) continue;
+             nvmtl_retain_resource(cb, s);
+             if (nvmtl_vk_bind_sampler(&cb->_c, set, [pair[0] unsignedIntValue], &s->_s))
+                 nvlog("static sampler slot %@: bind FAILED", pair[0]);
+diff -ruN --exclude=out --exclude=FIXES.patch --exclude=FIXES.md a/plugin/NVMTLEventSync.m b/plugin/NVMTLEventSync.m
+--- a/plugin/NVMTLEventSync.m	2026-10-15 09:28:42
++++ b/plugin/NVMTLEventSync.m	2026-10-15 10:16:48
+@@ -189,6 +189,10 @@
+     }
+     [self nvmtlSealPartWithSignal:event value:value restart:YES];
+ }
++// Set while this thread runs a command-buffer handler. Every handler of a queue runs on one serial order queue, so a
++// handler that waits on its own buffer (or a later one of the same queue) for the callback group would wait for itself:
++// Metal games do this to pace frames, and Apple's driver returns once the buffer has completed.
++static __thread unsigned nvmtl_in_cb_handler;
+ - (void)nvmtlDispatchHandlers:(NSArray *)handlers scheduled:(BOOL)scheduled {
+     if (!handlers.count) return;
+     dispatch_queue_t order;
+@@ -207,7 +211,9 @@
+     dispatch_async(order, ^{
+         dispatch_sync(target, ^{
+             for (MTLCommandBufferHandler handler in handlers) {
++                nvmtl_in_cb_handler++;
+                 handler(self);
++                nvmtl_in_cb_handler--;
+                 if (scheduled) dispatch_group_leave(self->_scheduledGroup);
+                 dispatch_group_leave(self->_callbackGroup);
+             }
+@@ -235,6 +241,18 @@
+ }
+ - (void)nvmtlFinishExecution:(NSError *)error {
+     if (_scheduleAfterPublish) { _scheduleAfterPublish = NO; [self nvmtlMarkScheduled]; }
++    if (error) {
++        [self nvmtlMarkScheduled];
++        for (NSUInteger i = _nextPart; i < _parts.count; i++) {
++            NVMTLSubmissionPart *p = _parts[i];
++            if (![p isKindOfClass:[NVMTLSubmissionPart class]]) continue;
++            if (p->signalEvent && [p->signalEvent respondsToSelector:@selector(setSignaledValue:)])
++                ((void(*)(id,SEL,uint64_t))objc_msgSend)(p->signalEvent, @selector(setSignaledValue:), p->value);
++            for (NSArray *s in p->signals)
++                if ([s[0] respondsToSelector:@selector(setSignaledValue:)])
++                    ((void(*)(id,SEL,uint64_t))objc_msgSend)(s[0], @selector(setSignaledValue:), [s[1] unsignedLongLongValue]);
++        }
++    }
+     for (NSUInteger i = _nextPart; i < _parts.count; i++) {
+         NVMTLSubmissionPart *p = _parts[i];
+         if (![p isKindOfClass:[NVMTLSubmissionPart class]] || !p->inflight) continue;
+diff -ruN --exclude=out --exclude=FIXES.patch --exclude=FIXES.md a/plugin/NVMTLLibraryLoad.m b/plugin/NVMTLLibraryLoad.m
+--- a/plugin/NVMTLLibraryLoad.m	2026-10-15 09:28:42
++++ b/plugin/NVMTLLibraryLoad.m	2026-10-15 10:15:04
+@@ -724,7 +724,7 @@
+     const uint8_t *b = raw.bytes; NSUInteger n = raw.length;
+     if (n < 0x28 || memcmp(b, "MTLB", 4) != 0) return out;
+     uint64_t off = 0; memcpy(&off, b + 0x18, 8);
+-    if (off + 4 > n) return out;
++    if (off > n || n - off < 4) return out;
+     uint32_t count = 0; memcpy(&count, b + off, 4);
+     NSUInteger pos = (NSUInteger)off + 4;
+     for (uint32_t k = 0; k < count && pos + 4 <= n; k++) {
+@@ -1862,7 +1862,7 @@
+         else [from appendFormat:@" [disk %@ UNREADABLE: %@]", path, le.localizedDescription ?: @"?"];
+     }
+     NSMutableArray<NSString *> *mods = [NSMutableArray new];
+-    for (NVMTLLibrary *l in libs) for (NSString *k in l->_airs) { NSString *m = l->_airs[k]; if ([mods indexOfObjectIdenticalTo:m] == NSNotFound) [mods addObject:m]; }
++    for (NVMTLLibrary *l in libs) for (NSString *k in l->_airs) { NSString *m = l->_airs[k]; if (m && [mods indexOfObjectIdenticalTo:m] == NSNotFound) [mods addObject:m]; }
+     NSString *want = [[decl.allObjects sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@","];
+     size_t n = mods.count;
+     const char **mls = calloc(n ? n : 1, sizeof *mls);
+diff -ruN --exclude=out --exclude=FIXES.patch --exclude=FIXES.md a/plugin/NVMTLObjects.m b/plugin/NVMTLObjects.m
+--- a/plugin/NVMTLObjects.m	2026-10-15 09:28:42
++++ b/plugin/NVMTLObjects.m	2026-10-15 10:17:14
+@@ -100,7 +100,14 @@
+     FILE *f = fopen("/Library/GPUBundles/nvmtl/nvrm610.conf", "r");
+     if (!f) { if (forgot) nvlog("conf: forgot %u inherited knob(s); no conf file", forgot); return; }
+     char line[512];
+-    unsigned took = 0;
++    unsigned took = 0, mine = 0;
++    // A line "name:KEY=value" applies only to the process named name (getprogname(): "java" for Minecraft, "WindowServer").
++    // Release builds drop every knob from the environment, so this is the only way to tune one game without changing
++    // WindowServer. The first pass takes this process's lines, so they win over a global line for the same key. NVK's
++    // own reader (nvmtl_cfg_getenv) matches keys at the start of a line only, so it never takes a prefixed line itself.
++    const char *me = getprogname();
++    for (int pass = 0; pass < 2; pass++) {
++    rewind(f);
+     while (fgets(line, sizeof line, f)) {
+         char *p = line;
+         while (*p == ' ' || *p == '\t') p++;
+@@ -109,17 +116,25 @@
+         if (!eq) continue;
+         *eq = 0;
+         char *key = p, *val = eq + 1;
++        char *colon = strchr(key, ':');
++        if (colon) {
++            *colon = 0;
++            if (pass != 0 || !me || strcmp(key, me)) continue;
++            key = colon + 1;
++        } else if (pass == 0) continue;
+         char *end = key + strlen(key);
+         while (end > key && (end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+         end = val + strlen(val);
+         while (end > val && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+         if (strncmp(key, "NVMTL_", 6) && strncmp(key, "NVK_", 4) && strncmp(key, "NVRM_", 5)) continue;
+         if (getenv(key)) continue;
+-        if (setenv(key, val, 0) == 0) { took++;
++        if (setenv(key, val, 0) == 0) { took++; if (pass == 0) mine++;
+             int k = snprintf(recbuf + recn, sizeof recbuf - recn, "%s%s=%s", recn ? ";" : "", key, val);
+             if (k > 0 && (size_t)k < sizeof recbuf - recn) recn += (size_t)k; else recbuf[recn] = 0; }
+     }
++    }
+     fclose(f);
++    if (mine) nvlog("conf: %u knob(s) for %s only", mine, me);
+     if (recn) setenv("NVMTL_CONF_SET", recbuf, 1);
+     if (took || forgot) nvlog("conf: %u knob(s) read from /Library/GPUBundles/nvmtl/nvrm610.conf, %u inherited conf knob(s) forgotten first (the environment still wins)", took, forgot);
+ }
+@@ -313,7 +328,7 @@
+ static BOOL nvmtl_res2_movable(NVMTLTexture *t) {
+     return !t->_parent && !t->_viewParent && !t->_backBuf && !t->_heap && !t->_subHeap && !t->_surf && !t->_vramOn && !t->_ownView
+         && !t->_shareable && !__atomic_load_n(&t->_nviews, __ATOMIC_ACQUIRE) && t->_i.img && !t->_i.placed && t->_i.usage
+-        && !t->_i.vpair && t->_i.samples <= 1 && !(t->_i.usage & 0x20u );
++        && !t->_i.vpair && t->_i.samples <= 1 && !(t->_i.usage & 0x20u ) && !t->_swzView;
+ }
+ static os_unfair_lock gRes2RegLock = OS_UNFAIR_LOCK_INIT;
+ static NSHashTable *gRes2Reg;
+@@ -851,6 +866,10 @@
+ void nvmtl_vk_buffer_retire(nvk_buffer *b);
+ - (void)dealloc {
+     if (_b.buf && nvmtl_trace_on()) nvtrace("BUFFREE 0x%llx len %zu", (unsigned long long)nvmtl_vk_buffer_address(&_b), _b.size);
++    // newBufferWithBytesNoCopy: the caller's pages are _hostPtr (copy path), the managed shadow, or _b itself
++    // (zero-copy import). retire() below zeroes those records, so take the pointer the deallocator gets first.
++    void *hostP = _hostPtr ?: (_shadow.buf ? _shadow.map : _b.map);
++    NSUInteger hostL = (NSUInteger)(_hostLen ?: (_shadow.buf ? _shadow.size : _b.size));
+     for (uint32_t k = 0; k < _nbpk; k++) nvmtl_vk_image_destroy(&_bpk[k].img);
+     free(_bpk); _bpk = NULL; _nbpk = 0;
+     nvmtl_vk_buffer_retire(&_b); if (_shadow.buf) nvmtl_vk_buffer_retire(&_shadow);
+@@ -858,7 +877,7 @@
+                     if (_subPlaced && c) { _subPlaced = NO; [h nvmtlGiveRange:_heapOffset length:c]; }
+                     [h nvmtlReleaseSubAllocation:c]; }
+     if (_hostDealloc) { void (^d)(void *, NSUInteger) = _hostDealloc; _hostDealloc = nil;
+-                        d(_hostPtr ?: _b.map, (NSUInteger)(_hostLen ?: _b.size)); } }
++                        d(hostP, hostL); } }
+ - (MTLStorageMode)storageMode { return _storage; }
+ - (void *)contents { nvmtl_buf_settle(self); return _shadow.map ? _shadow.map : (_hostPtr ? _hostPtr : _b.map); }
+ - (id<MTLHeap>)heap { return _heap ?: _subHeap; }
+@@ -4688,6 +4707,7 @@
+     @synchronized ([NVMTLCommandBuffer class]) { if (!_userDictionary) _userDictionary = [NSMutableDictionary new]; return _userDictionary; }
+ }
+ - (id<MTLParallelRenderCommandEncoder>)parallelRenderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
++    if (!_c.cb) { nvlog("%s: no recording (it could not restart after an event split) -> nil", sel_getName(_cmd)); return nil; }
+     nvmtl_g79_flush(self);
+     NVMTLParallelRenderCommandEncoder *p = [NVMTLParallelRenderCommandEncoder new];
+     _nEnc++;
+@@ -4700,6 +4720,7 @@
+     return p;
+ }
+ - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
++    if (!_c.cb) { nvlog("%s: no recording (it could not restart after an event split) -> nil", sel_getName(_cmd)); return nil; }
+     nvmtl_g79_flush(self);
+     NVMTLRenderCommandEncoder *e = [NVMTLRenderCommandEncoder new];
+     _nEnc++;
+@@ -4808,10 +4829,12 @@
+ }
+ - (void)commit { [self nvmtlSubmitWithEvents]; }
+ - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
++    if (!_c.cb) { nvlog("%s: no recording (it could not restart after an event split) -> nil", sel_getName(_cmd)); return nil; }
+     NVMTLComputeCommandEncoder *e = [NVMTLComputeCommandEncoder new]; e->_cb = self; _nEnc++; return e;
+ }
+ - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)t {
+     NVMTLComputeCommandEncoder *e = (NVMTLComputeCommandEncoder *)[self computeCommandEncoder];
++    if (!e) return nil;
+     e->_e78Concurrent = t == MTLDispatchTypeConcurrent; return e; }
+ - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDescriptor:(MTLComputePassDescriptor *)d {
+     return [self computeCommandEncoderWithDispatchType:d ? d.dispatchType : MTLDispatchTypeSerial]; }
+@@ -4819,10 +4842,12 @@
+ - (id<MTLResourceStateCommandEncoder>)resourceStateCommandEncoder { return nil; }
+ - (id<MTLResourceStateCommandEncoder>)resourceStateCommandEncoderWithDescriptor:(MTLResourceStatePassDescriptor *)d { return nil; }
+ - (id<MTLBlitCommandEncoder>)blitCommandEncoder {
++    if (!_c.cb) { nvlog("%s: no recording (it could not restart after an event split) -> nil", sel_getName(_cmd)); return nil; }
+     nvmtl_g79_flush(self);
+     NVMTLBlitCommandEncoder *e = [NVMTLBlitCommandEncoder new]; e->_cb = self; _nEnc++; return e;
+ }
+ - (id<MTLAccelerationStructureCommandEncoder>)accelerationStructureCommandEncoder {
++    if (!_c.cb) { nvlog("%s: no recording (it could not restart after an event split) -> nil", sel_getName(_cmd)); return nil; }
+     nvmtl_g79_flush(self);
+     NVMTLAccelerationStructureCommandEncoder *e = [NVMTLAccelerationStructureCommandEncoder new]; e->_cb = self; _nEnc++; return e;
+ }
+@@ -4874,13 +4899,13 @@
+     _nWait++; [_completionCondition lock];
+     while (!_completionReady) [_completionCondition wait];
+     [_completionCondition unlock];
+-    dispatch_group_wait(_callbackGroup, DISPATCH_TIME_FOREVER);
++    if (!nvmtl_in_cb_handler) dispatch_group_wait(_callbackGroup, DISPATCH_TIME_FOREVER);
+ }
+ - (void)waitUntilScheduled {
+     _nWait++; [_completionCondition lock];
+     while (!_wasScheduled && !_executionDone) [_completionCondition wait];
+     [_completionCondition unlock];
+-    dispatch_group_wait(_scheduledGroup, DISPATCH_TIME_FOREVER);
++    if (!nvmtl_in_cb_handler) dispatch_group_wait(_scheduledGroup, DISPATCH_TIME_FOREVER);
+ }
+ - (MTLCommandBufferStatus)status { [_completionCondition lock]; MTLCommandBufferStatus s = _cbstatus; [_completionCondition unlock]; return s; }
+ - (NSError *)error { return _cbError; }
+@@ -5099,7 +5124,8 @@
+     NSMethodSignature *m = [NVMTLRenderCommandEncoder instanceMethodSignatureForSelector:sel]; if (!m) return;
+     NSInvocation *inv = [NSInvocation invocationWithMethodSignature:m]; inv.selector = sel;
+     const void *p = d.bytes; [inv setArgument:&p atIndex:2]; [inv setArgument:&l atIndex:3]; [inv setArgument:&st atIndex:4]; [inv setArgument:&i atIndex:5];
+-    @synchronized (self) { if (!_keep) _keep = [NSMutableArray new]; [_keep addObject:d]; [_inv addObject:inv]; }
++    @synchronized (self) { if (!_keep) _keep = [NSMutableArray new]; [_keep addObject:d]; [_inv addObject:inv];
++                           (void)[self nvpPush:NVP_INV]; }
+ }
+ - (NSMethodSignature *)methodSignatureForSelector:(SEL)s {
+     NSMethodSignature *m = [NVMTLRenderCommandEncoder instanceMethodSignatureForSelector:s];
+@@ -5324,7 +5350,7 @@
+     if (!dst || !sc) { nvlog("build acceleration structure: nil %s", dst ? "scratch" : "structure"); return; }
+     [self nvmtlTrack:dst]; [self nvmtlTrack:sc];
+     if (!_cb->_resources) _cb->_resources = [NVMTLResSet new];
+-    static nvmtl_geom geoms[NVMTL_MAX_GEOMS]; int instance = 0; uint32_t icount = 0;
++    static _Thread_local nvmtl_geom geoms[NVMTL_MAX_GEOMS]; int instance = 0; uint32_t icount = 0;
+     uint32_t n = nvmtl_geoms_from_descriptor(desc, geoms, NVMTL_MAX_GEOMS, &instance, &icount, _cb->_resources);
+     uint64_t scratch_addr = (nvmtl_vk_buffer_address(&sc->_b) + soff + 255ull) & ~255ull;
+     if (![dst nvmtlEnsureCreated:instance]) return;
+diff -ruN --exclude=out --exclude=FIXES.patch --exclude=FIXES.md a/plugin/nvmtl_vk.c b/plugin/nvmtl_vk.c
+--- a/plugin/nvmtl_vk.c	2026-10-15 09:28:42
++++ b/plugin/nvmtl_vk.c	2026-10-15 12:35:31
+@@ -2510,6 +2510,12 @@
+     if (s == 0) return 1;
+     if (g_state != 1 || g_wit_state <= 0) return -1;
+     if (nvmtl_wit_read(s) == s) { __atomic_add_fetch(&g_wit_ok, 1, __ATOMIC_RELAXED); return 1; }
++    // A submit finished long after it ran (an async texture upload kept until its image is next read or freed)
++    // finds its slot of the 4096-entry ring rewritten by a later submit. Every submit goes to g_queue, and the
++    // barrier before each witness write waits for all work submitted earlier, so a later witness in this slot
++    // proves this one completed. Reading that as "missing" turned the whole backend off (Minecraft crashed).
++    { const uint32_t v = nvmtl_wit_read(s);
++      if (v && v != NVMTL_WSEQ_BLIND && (int32_t)(v - s) > 0) { __atomic_add_fetch(&g_wit_ok, 1, __ATOMIC_RELAXED); return 1; } }
+     static long wait_ms = -1; if (wait_ms < 0) { const char *e = getenv("NVMTL_WIT_WAIT_MS"); wait_ms = e ? atol(e) : 1000; }
+     const uint64_t w0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+     for (;;) {
+@@ -5786,39 +5792,48 @@
+     }
+     return on;
+ }
+-typedef struct { nvmtl_inflight infl; nvk_buffer stage; nvk_cmdbuf cb; } nvmtl_asyncup;
++// Pending uploads of every image sit in one FIFO, oldest first. The GPU runs every submission on one queue in order,
++// so a later copy into the same image already lands after an earlier one; only the staging memory, recording pool and
++// fence need to live until each copy has run. Each pending upload holds about three kernel connections (its pool's
++// BOs and its staging buffer are mapped, one connection per mapping) and the kext allows 4096 per process. When an
++// upload stayed pending until its own image was written again, Minecraft's start-up (thousands of textures, each
++// written once) left thousands pending, ran out of connections and aborted in NVK. So the FIFO is capped by count and
++// by staging bytes, and every new upload frees the ones that have already run.
++typedef struct nvmtl_asyncup { nvmtl_inflight infl; nvk_buffer stage; nvk_cmdbuf cb; uint64_t seq; size_t bytes; struct nvmtl_asyncup *next; } nvmtl_asyncup;
++#define NVMTL_ASYNCUP_MAX_LIVE  128
++#define NVMTL_ASYNCUP_MAX_BYTES ((size_t)256 << 20)
+ static pthread_mutex_t g_asyncup_mutex = PTHREAD_MUTEX_INITIALIZER;
+-// Atomically read and clear an image's pending async-upload handle (the consume/finish-first decision).
+-static uint64_t nvmtl_asyncup_take(nvk_image *img)
++static nvmtl_asyncup *g_asyncup_head, *g_asyncup_tail;
++static unsigned g_asyncup_live;
++static size_t g_asyncup_bytes;
++static uint64_t g_asyncup_seq;
++// Finish and free the oldest pending upload: always when `wait`, otherwise only if its copy has already run. Runs under
++// the lock, so once an upload has left the FIFO its copy is known to be complete (a barrier that finds the FIFO past
++// its image's sequence can touch the image at once). Returns 1 if one was retired.
++static int nvmtl_asyncup_retire_locked(int wait)
+ {
+-    if (!img) return 0;
+-    pthread_mutex_lock(&g_asyncup_mutex);
+-    nvmtl_up_state s = { img->up_token };
+-    const uint64_t token = nvmtl_up_before_consume(&s);
+-    img->up_token = 0;
+-    pthread_mutex_unlock(&g_asyncup_mutex);
+-    return token;
++    nvmtl_asyncup *a = g_asyncup_head;
++    if (!a) return 0;
++    if (!wait) { VkFence f = a->infl.fence; if (f && pvkWaitForFences(g_dev, 1, &f, VK_TRUE, 0) != VK_SUCCESS) return 0; }
++    g_asyncup_head = a->next; if (!g_asyncup_head) g_asyncup_tail = NULL;
++    g_asyncup_live--; g_asyncup_bytes -= a->bytes;
++    nvmtl_vk_submit_finish(&a->infl);
++    nvmtl_vk_buffer_destroy(&a->stage);
++    free(a);
++    return 1;
+ }
+-static void nvmtl_asyncup_store(nvk_image *img, uint64_t token)
++// Public guard for the consumers (readback, surface-out, migration, destroy): finish a pending upload first. The
++// image keeps the sequence of its newest upload; everything up to it in the FIFO is finished.
++void nvmtl_vk_image_upload_barrier(nvk_image *img)
+ {
++    if (!img) return;
+     pthread_mutex_lock(&g_asyncup_mutex);
+     nvmtl_up_state s = { img->up_token };
+-    nvmtl_up_set(&s, token);
+-    img->up_token = s.infl;
++    const uint64_t want = nvmtl_up_before_consume(&s);
++    img->up_token = 0;
++    while (want && g_asyncup_head && g_asyncup_head->seq <= want) nvmtl_asyncup_retire_locked(1);
+     pthread_mutex_unlock(&g_asyncup_mutex);
+ }
+-// Finish (fence-wait) and free a handle taken from an image. Called OUTSIDE the lock so one image's wait
+-// never blocks uploads to another; a no-op on 0 (which is every call on the synchronous path).
+-static void nvmtl_asyncup_finish(uint64_t token)
+-{
+-    if (!token) return;
+-    nvmtl_asyncup *au = (nvmtl_asyncup *)(uintptr_t)token;
+-    nvmtl_vk_submit_finish(&au->infl);
+-    nvmtl_vk_buffer_destroy(&au->stage);
+-    free(au);
+-}
+-// Public guard for the consumers (readback, surface-out, migration, destroy): finish a pending upload first.
+-void nvmtl_vk_image_upload_barrier(nvk_image *img) { nvmtl_asyncup_finish(nvmtl_asyncup_take(img)); }
+ 
+ int nvmtl_vk_image_write_region_level(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes,
+                                       uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t level)
+@@ -5843,8 +5858,14 @@
+     nvk_buffer *stageb, stage_sync;
+     nvk_cmdbuf local_cb, *c;
+     if (mode == NVMTL_UP_SUBMIT_ASYNC) {
+-        // a prior async upload to THIS image must land before we overwrite the texture or its staging
+-        if (finish_first) nvmtl_asyncup_finish(nvmtl_asyncup_take(img));
++        // Free the uploads that have already run; wait for the oldest only when too many are pending, so the
++        // connections and staging they hold stay bounded.
++        (void)finish_first;
++        pthread_mutex_lock(&g_asyncup_mutex);
++        while (nvmtl_asyncup_retire_locked(0)) {}
++        while (g_asyncup_head && (g_asyncup_live >= NVMTL_ASYNCUP_MAX_LIVE || g_asyncup_bytes + bytes > NVMTL_ASYNCUP_MAX_BYTES))
++            nvmtl_asyncup_retire_locked(1);
++        pthread_mutex_unlock(&g_asyncup_mutex);
+         au = (nvmtl_asyncup *)calloc(1, sizeof *au);
+         if (!au || nvmtl_vk_buffer_create(bytes, 1, &au->stage)) { free(au); au = NULL; }   // fall back to sync
+     }
+@@ -5866,7 +5887,13 @@
+         // submit without waiting; queue order + the SHADER_READ barrier above order the copy before any later
+         // draw that samples this image, and the handle is finished before a readback, destroy or re-upload.
+         if (nvmtl_vk_submit_begin_at(c, &au->infl, "tex upload async")) { nvmtl_vk_buffer_destroy(&au->stage); free(au); return -1; }
+-        nvmtl_asyncup_store(img, (uint64_t)(uintptr_t)au);
++        // append to the FIFO; the image remembers the newest sequence, so its barrier finishes this one too
++        pthread_mutex_lock(&g_asyncup_mutex);
++        au->bytes = bytes; au->seq = ++g_asyncup_seq;
++        if (g_asyncup_tail) g_asyncup_tail->next = au; else g_asyncup_head = au;
++        g_asyncup_tail = au; g_asyncup_live++; g_asyncup_bytes += bytes;
++        img->up_token = au->seq;
++        pthread_mutex_unlock(&g_asyncup_mutex);
+         return 0;
+     }
+     return nvmtl_vk_submit_wait(c);
+@@ -6022,7 +6049,7 @@
+ {
+     if (nvmtl_vk_init() || !g_rt) return -1;
+     if (n > NVMTL_MAX_GEOMS) { nvlog("vk: %u geometries in one acceleration structure — more than %d carried", n, NVMTL_MAX_GEOMS); return -1; }
+-    static VkAccelerationStructureGeometryKHR geoms[NVMTL_MAX_GEOMS]; static uint32_t counts[NVMTL_MAX_GEOMS];
++    static _Thread_local VkAccelerationStructureGeometryKHR geoms[NVMTL_MAX_GEOMS]; static _Thread_local uint32_t counts[NVMTL_MAX_GEOMS];
+     uint32_t ng = nvmtl_fill_geometries(g, n, 0, instance_count, instance, geoms, counts);
+     VkAccelerationStructureBuildGeometryInfoKHR bi = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR, NULL,
+         instance ? VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR : VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+@@ -6057,8 +6084,8 @@
+ {
+     if (!g_rt || !dst->as) return -1;
+     if (n > NVMTL_MAX_GEOMS) return -1;
+-    static VkAccelerationStructureGeometryKHR geoms[NVMTL_MAX_GEOMS]; static uint32_t counts[NVMTL_MAX_GEOMS];
+-    static VkAccelerationStructureBuildRangeInfoKHR ranges[NVMTL_MAX_GEOMS];
++    static _Thread_local VkAccelerationStructureGeometryKHR geoms[NVMTL_MAX_GEOMS]; static _Thread_local uint32_t counts[NVMTL_MAX_GEOMS];
++    static _Thread_local VkAccelerationStructureBuildRangeInfoKHR ranges[NVMTL_MAX_GEOMS];
+     uint32_t ng = nvmtl_fill_geometries(g, n, instances_addr, instance_count, dst->instance, geoms, counts);
+     for (uint32_t i = 0; i < ng; i++) ranges[i] = (VkAccelerationStructureBuildRangeInfoKHR){ counts[i], 0, 0, 0 };
+     VkAccelerationStructureBuildGeometryInfoKHR bi = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR, NULL,
+diff -ruN --exclude=out --exclude=FIXES.patch --exclude=FIXES.md a/tools/nvmtl_harness.m b/tools/nvmtl_harness.m
+--- a/tools/nvmtl_harness.m	1970-01-01 03:00:00
++++ b/tools/nvmtl_harness.m	2026-10-15 12:34:19
+@@ -0,0 +1,302 @@
++// Loads a built NVMTLDriver into this process (no install) and runs one test.
++// usage: harness <path/to/NVMTLDriver> <test>
++#import <Foundation/Foundation.h>
++#import <Metal/Metal.h>
++#import <IOKit/IOKitLib.h>
++#import <objc/message.h>
++#include <dlfcn.h>
++#include <unistd.h>
++#include <signal.h>
++
++static id<MTLDevice> dev;
++static void timeout_hit(int s) { (void)s; const char m[] = "RESULT TIMEOUT (hang)\n"; write(1, m, sizeof m - 1); _exit(124); }
++
++static id<MTLComputePipelineState> pso(NSString *src, NSString *fn) {
++    NSError *e = nil;
++    id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&e];
++    if (!lib) { printf("RESULT FAIL library %s\n", e.description.UTF8String); exit(2); }
++    id<MTLFunction> f = [lib newFunctionWithName:fn];
++    id<MTLComputePipelineState> p = [dev newComputePipelineStateWithFunction:f error:&e];
++    if (!p) { printf("RESULT FAIL pso %s\n", e.description.UTF8String); exit(2); }
++    return p;
++}
++
++static NSString *kSrc = @"#include <metal_stdlib>\nusing namespace metal;\n"
++    "kernel void twice(device float *a [[buffer(0)]], uint i [[thread_position_in_grid]]) { a[i] = a[i] * 2.0f + 1.0f; }\n"
++    "kernel void rd(device const float4 *a [[buffer(0)]], device float *o [[buffer(1)]], constant uint &cnt [[buffer(2)]],"
++    " uint i [[thread_position_in_grid]], uint n [[threads_per_grid]]) { float4 s = 0; for (uint k = i; k < cnt; k += n) s += a[k]; o[i] = s.x+s.y+s.z+s.w; }\n";
++
++static int test_compute(void) {
++    id<MTLComputePipelineState> p = pso(kSrc, @"twice");
++    id<MTLCommandQueue> q = [dev newCommandQueue];
++    const int n = 1 << 20;
++    id<MTLBuffer> b = [dev newBufferWithLength:n * 4 options:MTLResourceStorageModeShared];
++    float *f = b.contents; for (int i = 0; i < n; i++) f[i] = i;
++    id<MTLCommandBuffer> cb = [q commandBuffer];
++    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
++    [e setComputePipelineState:p]; [e setBuffer:b offset:0 atIndex:0];
++    [e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
++    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
++    for (int i = 0; i < n; i++) if (f[i] != i * 2.0f + 1.0f) { printf("RESULT FAIL a[%d]=%f\n", i, f[i]); return 1; }
++    printf("RESULT PASS compute %d floats correct, status %ld\n", n, (long)cb.status);
++    return 0;
++}
++
++// Metal games wait on a command buffer from a completion handler; Apple returns once it completed.
++static int test_handler_wait(void) {
++    id<MTLCommandQueue> q = [dev newCommandQueue];
++    id<MTLCommandBuffer> cb = [q commandBuffer];
++    id<MTLBuffer> b = [dev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
++    id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
++    [bl fillBuffer:b range:NSMakeRange(0, 4096) value:7]; [bl endEncoding];
++    dispatch_semaphore_t done = dispatch_semaphore_create(0);
++    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { [c waitUntilCompleted]; dispatch_semaphore_signal(done); }];
++    [cb commit];
++    if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC))) { printf("RESULT FAIL handler waiting on its own buffer hung\n"); return 1; }
++    [cb waitUntilCompleted];
++    printf("RESULT PASS handler can wait on its own command buffer\n");
++    return 0;
++}
++
++static int test_nocopy_dealloc(void) {
++    const size_t len = 64 * 1024;
++    void *mem = NULL; posix_memalign(&mem, 16384, len); memset(mem, 3, len);
++    __block void *gotP = (void *)1; __block NSUInteger gotL = 1;
++    @autoreleasepool {
++        id<MTLBuffer> b = [dev newBufferWithBytesNoCopy:mem length:len options:MTLResourceStorageModeShared
++                                            deallocator:^(void *p, NSUInteger l) { gotP = p; gotL = l; }];
++        if (!b) { printf("RESULT FAIL nil buffer\n"); return 1; }
++        b = nil;
++    }
++    for (int i = 0; i < 100 && gotP == (void *)1; i++) usleep(10000);
++    if (gotP == mem && gotL == len) { printf("RESULT PASS deallocator got the caller's pointer and length\n"); free(mem); return 0; }
++    printf("RESULT FAIL deallocator got (%p, %lu), expected (%p, %zu)\n", gotP, (unsigned long)gotL, mem, len);
++    return 1;
++}
++
++static int test_events(void) {
++    id<MTLCommandQueue> q = [dev newCommandQueue];
++    id<MTLSharedEvent> ev = [dev newSharedEvent];
++    id<MTLBuffer> b = [dev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
++    id<MTLCommandBuffer> a = [q commandBuffer];
++    [a encodeWaitForEvent:ev value:1];
++    id<MTLBlitCommandEncoder> bl = [a blitCommandEncoder]; [bl fillBuffer:b range:NSMakeRange(0, 4096) value:9]; [bl endEncoding];
++    [a encodeSignalEvent:ev value:2];
++    [a commit];
++    usleep(100000);
++    if (a.status == MTLCommandBufferStatusCompleted) { printf("RESULT FAIL ran before its wait was signalled\n"); return 1; }
++    ev.signaledValue = 1;
++    [a waitUntilCompleted];
++    if (ev.signaledValue != 2 || ((uint8_t *)b.contents)[100] != 9) { printf("RESULT FAIL event %llu byte %u\n", ev.signaledValue, ((uint8_t *)b.contents)[100]); return 1; }
++    printf("RESULT PASS shared event wait/signal ordering\n");
++    return 0;
++}
++
++static double read_ms(MTLResourceOptions opt, size_t mb) {
++    id<MTLComputePipelineState> p = pso(kSrc, @"rd");
++    id<MTLCommandQueue> q = [dev newCommandQueue];
++    size_t size = mb << 20;
++    id<MTLBuffer> a = [dev newBufferWithLength:size options:opt];
++    if (opt == MTLResourceStorageModeShared) memset(a.contents, 1, size);
++    else { id<MTLCommandBuffer> c = [q commandBuffer]; id<MTLBlitCommandEncoder> bl = [c blitCommandEncoder];
++           [bl fillBuffer:a range:NSMakeRange(0, size) value:1]; [bl endEncoding]; [c commit]; [c waitUntilCompleted]; }
++    id<MTLBuffer> o = [dev newBufferWithLength:4 * 65536 options:MTLResourceStorageModeShared];
++    uint32_t cnt = (uint32_t)(size / 16); double best = 1e9;
++    for (int r = 0; r < 5; r++) {
++        id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
++        [e setComputePipelineState:p]; [e setBuffer:a offset:0 atIndex:0]; [e setBuffer:o offset:0 atIndex:1]; [e setBytes:&cnt length:4 atIndex:2];
++        [e dispatchThreads:MTLSizeMake(65536, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
++        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
++        if (cb.status != MTLCommandBufferStatusCompleted) { printf("RESULT FAIL status %ld\n", (long)cb.status); exit(1); }
++        double t = cb.GPUEndTime - cb.GPUStartTime; if (t > 0 && t < best) best = t;
++    }
++    return best * 1000;
++}
++
++static int test_bandwidth(void) {
++    double p = read_ms(MTLResourceStorageModePrivate, 256), s = read_ms(MTLResourceStorageModeShared, 256);
++    printf("RESULT PASS read 256MB: private %.2f ms (%.0f GB/s), shared %.2f ms (%.1f GB/s)\n", p, 268.4 / p, s, 268.4 / s);
++    return 0;
++}
++
++// Many small command buffers, each waited from a completion handler, from two threads at once.
++static int test_stress(void) {
++    id<MTLComputePipelineState> p = pso(kSrc, @"twice");
++    __block int bad = 0;
++    dispatch_apply(4, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t t) {
++        id<MTLCommandQueue> q = [dev newCommandQueue];
++        id<MTLBuffer> b = [dev newBufferWithLength:4096 * 4 options:MTLResourceStorageModeShared];
++        for (int it = 0; it < 300; it++) {
++            float *f = b.contents; for (int i = 0; i < 4096; i++) f[i] = 1;
++            id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
++            [e setComputePipelineState:p]; [e setBuffer:b offset:0 atIndex:0];
++            [e dispatchThreads:MTLSizeMake(4096, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)]; [e endEncoding];
++            [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { (void)c; }];
++            [cb commit]; [cb waitUntilCompleted];
++            if (cb.status != MTLCommandBufferStatusCompleted || f[4095] != 3.0f) __sync_fetch_and_add(&bad, 1);
++        }
++        (void)t;
++    });
++    if (bad) { printf("RESULT FAIL %d of 1200 wrong\n", bad); return 1; }
++    printf("RESULT PASS 1200 command buffers on 4 threads\n");
++    return 0;
++}
++
++
++// Many small uploads into one texture with GPU reads in between, as an atlas animation does. Each GPU read must
++// see exactly the uploads made before it was committed, and the final readback must match a CPU reference.
++// With NVMTL_ASYNC_TEX_UPLOAD=1 the uploads are left in flight, so this checks they still land in order.
++static int test_texture_uploads(void) {
++    enum { W = 256, H = 256, T = 16, N = 600, EVERY = 50 };
++    NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
++        "kernel void tcopy(texture2d<float, access::read> t [[texture(0)]], device uchar4 *o [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {"
++        " o[g.y * 256 + g.x] = uchar4(t.read(g) * 255.0f + 0.5f); }\n";
++    id<MTLComputePipelineState> p = pso(src, @"tcopy");
++    id<MTLCommandQueue> q = [dev newCommandQueue];
++    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:W height:H mipmapped:NO];
++    d.usage = MTLTextureUsageShaderRead;
++    id<MTLTexture> tex = [dev newTextureWithDescriptor:d];
++    static uint32_t ref[W * H], tile[T * T];
++    memset(ref, 0, sizeof ref);
++    [tex replaceRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0 withBytes:ref bytesPerRow:W * 4];
++    NSMutableArray *snaps = [NSMutableArray new], *bufs = [NSMutableArray new], *cbs = [NSMutableArray new];
++    uint32_t seed = 12345;
++    for (int i = 1; i <= N; i++) {
++        seed = seed * 1103515245u + 12345u; uint32_t x = (seed >> 8) % (W - T + 1);
++        seed = seed * 1103515245u + 12345u; uint32_t y = (seed >> 8) % (H - T + 1);
++        uint32_t v = 0xFF000000u | (uint32_t)i * 2654435761u >> 8;
++        for (int k = 0; k < T * T; k++) tile[k] = v;
++        [tex replaceRegion:MTLRegionMake2D(x, y, T, T) mipmapLevel:0 withBytes:tile bytesPerRow:T * 4];
++        for (int r = 0; r < T; r++) for (int c = 0; c < T; c++) ref[(y + r) * W + x + c] = v;
++        if (i % EVERY == 0) {
++            id<MTLBuffer> o = [dev newBufferWithLength:W * H * 4 options:MTLResourceStorageModeShared];
++            id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
++            [e setComputePipelineState:p]; [e setTexture:tex atIndex:0]; [e setBuffer:o offset:0 atIndex:0];
++            [e dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)]; [e endEncoding];
++            // Metal forbids changing a texture while committed GPU work still reads it (Apple's GL waits for that
++            // itself), so the read finishes before the next upload; the uploads themselves are never waited.
++            [cb commit]; [cb waitUntilCompleted];
++            [snaps addObject:[NSData dataWithBytes:ref length:sizeof ref]]; [bufs addObject:o]; [cbs addObject:cb];
++        }
++    }
++    int bad = 0;
++    for (NSUInteger k = 0; k < cbs.count; k++) {
++        id<MTLCommandBuffer> cb = cbs[k]; [cb waitUntilCompleted];
++        if (cb.status != MTLCommandBufferStatusCompleted) { printf("RESULT FAIL GPU read %lu status %ld\n", (unsigned long)k, (long)cb.status); return 1; }
++        if (memcmp([bufs[k] contents], [snaps[k] bytes], W * H * 4)) { bad++; printf("  GPU read %lu does not match the uploads made before it\n", (unsigned long)k); }
++    }
++    static uint32_t back[W * H];
++    [tex getBytes:back bytesPerRow:W * 4 fromRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0];
++    if (memcmp(back, ref, sizeof ref)) { printf("RESULT FAIL final readback differs from the uploads\n"); return 1; }
++    if (bad) { printf("RESULT FAIL %d of %lu GPU reads saw the wrong uploads\n", bad, (unsigned long)cbs.count); return 1; }
++    printf("RESULT PASS %d uploads, %lu interleaved GPU reads and the readback all match\n", N, (unsigned long)cbs.count);
++    return 0;
++}
++
++// Frame-shaped upload cost: each "frame" queues ~2 ms of GPU work, then makes 20 small texture uploads.
++static int test_texture_upload_bench(void) {
++    id<MTLComputePipelineState> p = pso(kSrc, @"rd");
++    id<MTLCommandQueue> q = [dev newCommandQueue];
++    id<MTLBuffer> a = [dev newBufferWithLength:64 << 20 options:MTLResourceStorageModePrivate];
++    id<MTLBuffer> o = [dev newBufferWithLength:4 * 65536 options:MTLResourceStorageModePrivate];
++    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1024 height:512 mipmapped:NO];
++    id<MTLTexture> tex = [dev newTextureWithDescriptor:d];
++    static uint32_t tile[16 * 16]; uint32_t cnt = (64 << 20) / 16;
++    id<MTLCommandBuffer> last = nil;
++    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    for (int f = 0; f < 60; f++) {
++        for (int r = 0; r < 8; r++) {   // 8 x 64 MB reads ~ 2 ms on this class of GPU
++            id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
++            [e setComputePipelineState:p]; [e setBuffer:a offset:0 atIndex:0]; [e setBuffer:o offset:0 atIndex:1]; [e setBytes:&cnt length:4 atIndex:2];
++            [e dispatchThreads:MTLSizeMake(65536, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)]; [e endEncoding]; [cb commit]; last = cb;
++        }
++        for (int u = 0; u < 20; u++) {
++            for (int k = 0; k < 256; k++) tile[k] = (uint32_t)(f * 20 + u);
++            [tex replaceRegion:MTLRegionMake2D((u % 32) * 16, (u / 32) * 16, 16, 16) mipmapLevel:0 withBytes:tile bytesPerRow:64];
++        }
++    }
++    [last waitUntilCompleted];
++    const double ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6;
++    printf("RESULT PASS 60 frames with 20 uploads each: %.1f ms total, %.2f ms per frame\n", ms, ms / 60);
++    return 0;
++}
++
++// An upload left in flight while thousands of other submissions go by, then read back. The completion witness
++// ring has 4096 slots; an upload finished after its slot was reused must not take the whole GPU backend down.
++static int test_late_upload_finish(void) {
++    id<MTLCommandQueue> q = [dev newCommandQueue];
++    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:64 height:64 mipmapped:NO];
++    id<MTLTexture> tex = [dev newTextureWithDescriptor:d];
++    static uint32_t px[64 * 64]; for (int i = 0; i < 64 * 64; i++) px[i] = 0xFF00FF00u;
++    [tex replaceRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0 withBytes:px bytesPerRow:256];
++    id<MTLBuffer> b = [dev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
++    id<MTLCommandBuffer> cb = nil;
++    for (int i = 0; i < 5000; i++) {
++        cb = [q commandBuffer]; id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
++        [bl fillBuffer:b range:NSMakeRange(0, 4096) value:(uint8_t)i]; [bl endEncoding]; [cb commit];
++        if (i % 64 == 63) [cb waitUntilCompleted];
++    }
++    [cb waitUntilCompleted];
++    static uint32_t back[64 * 64];
++    [tex getBytes:back bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
++    id<MTLCommandBuffer> after = [q commandBuffer]; id<MTLBlitCommandEncoder> bl = [after blitCommandEncoder];
++    [bl fillBuffer:b range:NSMakeRange(0, 4096) value:7]; [bl endEncoding]; [after commit]; [after waitUntilCompleted];
++    if (after.status != MTLCommandBufferStatusCompleted) { printf("RESULT FAIL GPU backend went down after finishing a late upload (status %ld)\n", (long)after.status); return 1; }
++    if (memcmp(back, px, sizeof px)) { printf("RESULT FAIL readback differs\n"); return 1; }
++    printf("RESULT PASS upload finished after 5000 submissions; GPU still works\n");
++    return 0;
++}
++
++// Minecraft-shaped startup: thousands of textures, each uploaded once and never touched again. Every pending async
++// upload holds kernel connections (its recording pool and staging memory); the kext allows 4096 per process, so
++// uploads that stay pending until the SAME texture is written again exhaust it and every later map fails.
++static int test_many_textures(void) {
++    enum { N = 3000, S = 16 };
++    id<MTLCommandQueue> q = [dev newCommandQueue];
++    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:S height:S mipmapped:NO];
++    NSMutableArray *texs = [NSMutableArray arrayWithCapacity:N];
++    static uint32_t px[S * S];
++    for (int i = 0; i < N; i++) {
++        id<MTLTexture> t = [dev newTextureWithDescriptor:d];
++        if (!t) { printf("RESULT FAIL texture %d not created\n", i); return 1; }
++        for (int k = 0; k < S * S; k++) px[k] = 0xFF000000u | (uint32_t)i;
++        [t replaceRegion:MTLRegionMake2D(0, 0, S, S) mipmapLevel:0 withBytes:px bytesPerRow:S * 4];
++        [texs addObject:t];
++    }
++    id<MTLBuffer> b = [dev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
++    id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
++    [bl fillBuffer:b range:NSMakeRange(0, 4096) value:9]; [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
++    if (cb.status != MTLCommandBufferStatusCompleted || ((uint8_t *)b.contents)[100] != 9) {
++        printf("RESULT FAIL GPU work after %d uploads did not run (status %ld)\n", N, (long)cb.status); return 1; }
++    static uint32_t back[S * S];
++    for (int i = 0; i < N; i += 499) {
++        [texs[i] getBytes:back bytesPerRow:S * 4 fromRegion:MTLRegionMake2D(0, 0, S, S) mipmapLevel:0];
++        if (back[0] != (0xFF000000u | (uint32_t)i) || back[S * S - 1] != back[0]) { printf("RESULT FAIL texture %d reads back 0x%08x\n", i, back[0]); return 1; }
++    }
++    printf("RESULT PASS %d textures uploaded once each; GPU still works and readbacks match\n", N);
++    return 0;
++}
++
++int main(int argc, char **argv) { @autoreleasepool {
++    if (argc != 3) return 2;
++    signal(SIGALRM, timeout_hit); alarm(40);
++    if (!dlopen(argv[1], RTLD_NOW | RTLD_LOCAL)) { printf("RESULT FAIL load %s\n", dlerror()); return 3; }
++    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
++    if (!svc) { printf("RESULT FAIL no NVAccel\n"); return 4; }
++    dev = ((id(*)(id, SEL, mach_port_t))objc_msgSend)([NSClassFromString(@"NVMTLDevice") alloc], NSSelectorFromString(@"initWithAcceleratorPort:"), svc);
++    IOObjectRelease(svc);
++    if (!dev) { printf("RESULT FAIL no device\n"); return 5; }
++    setvbuf(stdout, NULL, _IONBF, 0);
++    const char *t = argv[2];
++    if (!strcmp(t, "compute")) return test_compute();
++    if (!strcmp(t, "handler")) return test_handler_wait();
++    if (!strcmp(t, "nocopy")) return test_nocopy_dealloc();
++    if (!strcmp(t, "events")) return test_events();
++    if (!strcmp(t, "bandwidth")) return test_bandwidth();
++    if (!strcmp(t, "stress")) return test_stress();
++    if (!strcmp(t, "texup")) return test_texture_uploads();
++    if (!strcmp(t, "texbench")) return test_texture_upload_bench();
++    if (!strcmp(t, "texlate")) return test_late_upload_finish();
++    if (!strcmp(t, "texmany")) return test_many_textures();
++    printf("RESULT FAIL unknown test\n"); return 2;
++} }
+diff -ruN --exclude=out --exclude=FIXES.patch --exclude=FIXES.md a/tools/run_harness.sh b/tools/run_harness.sh
+--- a/tools/run_harness.sh	1970-01-01 03:00:00
++++ b/tools/run_harness.sh	2026-10-15 12:37:30
+@@ -0,0 +1,21 @@
++#!/bin/bash
++# Loads a built NVMTLDriver into a test process (nothing is installed) and runs every harness test.
++# usage: tools/run_harness.sh [path/to/NVMTLDriver]   (default: out/NVMTLDriver)
++set -u
++cd "$(dirname "$0")/.."
++BIN=${1:-out/NVMTLDriver}
++W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
++D=$W/NVMTLDriver.bundle/Contents/MacOS; mkdir -p "$D"
++cp "$BIN" "$D/NVMTLDriver"
++# the translator and AIR runtime are found next to the plugin; take the installed ones
++cp /Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvmtl_translate.dylib "$D/"
++ditto /Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/air-runtime "$D/air-runtime"
++# named "java" so the plugin takes this machine's java:KEY=value lines from nvrm610.conf, as Minecraft does
++xcrun clang -fobjc-arc -O1 tools/nvmtl_harness.m -o "$W/java" -framework Foundation -framework Metal -framework IOKit || exit 1
++fail=0
++for t in compute handler nocopy events stress texup texlate texmany bandwidth; do
++  "$W/java" "$D/NVMTLDriver" $t > "$W/out.txt" 2>&1; rc=$?
++  printf '%-10s rc=%-3s %s\n' "$t" "$rc" "$(grep RESULT "$W/out.txt" | head -1)"
++  [ $rc = 0 ] || fail=1
++done
++exit $fail
